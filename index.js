@@ -3,10 +3,17 @@ import * as model from "./models.js";
 import { t } from "./i18n.js";
 
 const PAGE = 50;
+const LIKED_TTL = 30000;
+const LIKED_PAGE_TTL = 5 * 60 * 1000;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const offsetOf = (value) => Math.max(0, Math.floor(Number(value) || 0));
 const currentId = () => host.storage.get("account")?.id || "";
+const sessionKey = (userId) => `${userId}:${host.storage.get("sessionEpoch") || 0}`;
+const attachAdded = (track, added) => (track && added ? { ...track, added } : track);
+const isLikedPlaylist = (x, userId) => Boolean(userId) && String(x?.creator?.userId ?? x?.userId ?? "") === userId && Number(x?.specialType) === 5;
 let loginSequence = 0;
+let likedPlaylistCache = null;
+let likedCache = null;
 
 export async function account() {
   if (!hasSession()) return null;
@@ -105,6 +112,8 @@ export async function signIn() {
 export function signOut() {
   // 仅退出本插件，避免使用户官方客户端的登录失效。
   loginSequence++;
+  likedPlaylistCache = null;
+  likedCache = null;
   resetSession();
 }
 
@@ -173,40 +182,36 @@ export async function playlist({ id: value }) {
   const j = await api("/api/v6/playlist/detail", { id: id(value), n: 1000, s: 0 });
   if (!j.playlist) fail("unavailable", "歌单不存在，或没有访问权限");
   const p = j.playlist;
-  const ids = (p.trackIds || []).map((x) => String(x.id));
-  if (ids.length > 10000) fail("unsupported", "该歌单超过一万首，暂不支持一次载入，请拆分后再打开");
+  const entries = (p.trackIds || []).map((x) => ({ id: String(x.id), added: model.timestamp(x.at) }));
+  if (entries.length > 10000) fail("unsupported", "该歌单超过一万首，暂不支持一次载入，请拆分后再打开");
   const privileges = new Map((j.privileges || []).map((x) => [String(x.id), x]));
   const known = new Map((p.tracks || []).map((x) => [String(x.id), model.track(x, privileges.get(String(x.id)))]));
-  const missing = ids.filter((x) => !known.has(x));
-  for (const t of await details(missing)) known.set(t.id, t);
-  const tracks = ids.length ? ids.map((x) => known.get(x)) : [...known.values()];
-  // 歌单页的「心动模式」按钮：宿主把 station id 带回 station()，seed 是点击/正在播放的歌。
+  const missing = [...new Set(entries.map((x) => x.id).filter((x) => !known.has(x)))];
+  for (const track of await details(missing)) known.set(track.id, track);
+  const tracks = entries.length
+    ? entries.map(({ id: trackId, added }) => attachAdded(known.get(trackId), added))
+    : [...known.values()];
   return { ...model.playlist(p, currentId()), station: HEARTBEAT, tracks, trackCount: p.trackCount ?? tracks.length };
 }
 
 export async function playlists() {
   const user = requireAccount();
+  const key = sessionKey(user.id);
   const result = [];
   // API 最多 1000 条一页；按 more 取完，不能静默丢失后面的歌单。
   for (let offset = 0; offset < 10000; offset += 1000) {
     const j = await api("/api/user/playlist", { uid: user.id, limit: 1000, offset, includeVideo: false });
     const items = j.playlist || [];
-    result.push(...items.map((x) => model.playlist(x, user.id)));
+    for (const x of items) {
+      const mapped = model.playlist(x, user.id);
+      if (mapped.fixed && mapped.id && sessionKey(currentId()) === key) {
+        likedPlaylistCache = { key, id: mapped.id };
+      }
+      result.push(mapped);
+    }
     if (!j.more || !items.length) return result;
   }
   fail("unsupported", "账号歌单数量超过插件当前支持范围");
-}
-
-// 「我喜欢的音乐」是 specialType 5 的歌单；收藏时间排序和心动模式的歌单上下文都靠它。
-async function likedPlaylistId(user) {
-  const cached = host.storage.get("likedListId");
-  if (cached) return String(cached);
-  const j = await api("/api/user/playlist", { uid: user.id, limit: 1000, offset: 0, includeVideo: false });
-  const special = (j.playlist || []).find((x) => Number(x.specialType) === 5);
-  if (!special?.id) return "";
-  host.storage.set("likedListId", String(special.id));
-  host.storage.set("likedCover", String(special.coverImgUrl || ""));
-  return String(special.id);
 }
 
 // 「我喜欢的音乐」歌单封面；只在第一次需要时取一次。
@@ -243,19 +248,74 @@ async function likedOrder(user) {
 async function likedIds() {
   const user = requireAccount();
   const cached = host.storage.get("likedIds");
-  if (Array.isArray(cached) && Date.now() - (host.storage.get("likedAt") || 0) < 30000) return cached;
-  // 取不到歌单顺序时退回 like/get 的原始顺序，至少不丢收藏。
-  const ordered = await likedOrder(user);
-  const ids = ordered || (await api("/api/song/like/get", { uid: user.id })).ids.map(String);
+  if (Array.isArray(cached) && Date.now() - (host.storage.get("likedAt") || 0) < LIKED_TTL) return cached;
+  const j = await api("/api/song/like/get", { uid: user.id });
+  const ids = (j.ids || []).map(String);
   host.storage.set("likedIds", ids);
   host.storage.set("likedAt", Date.now());
   return ids;
 }
 
+async function likedPlaylistId(user) {
+  const key = sessionKey(user.id);
+  if (likedPlaylistCache?.key === key) return likedPlaylistCache.id;
+  for (let offset = 0; offset < 10000; offset += 1000) {
+    const j = await api("/api/user/playlist", { uid: user.id, limit: 1000, offset, includeVideo: false });
+    const items = j.playlist || [];
+    const found = items.find((x) => isLikedPlaylist(x, user.id));
+    if (found?.id != null) {
+      const value = String(found.id);
+      if (sessionKey(currentId()) === key) likedPlaylistCache = { key, id: value };
+      return value;
+    }
+    if (!j.more || !items.length) return "";
+  }
+  return "";
+}
+
+async function likedSnapshot(refresh) {
+  const user = requireAccount();
+  const key = sessionKey(user.id);
+  const ttl = refresh ? LIKED_TTL : LIKED_PAGE_TTL;
+  if (likedCache?.key === key && Date.now() - likedCache.fetchedAt < ttl) return likedCache;
+  let entries = null;
+  let known = new Map();
+  const playlistId = await likedPlaylistId(user);
+  if (playlistId) {
+    const j = await api("/api/v6/playlist/detail", { id: id(playlistId), n: 1000, s: 0 });
+    const p = j.playlist;
+    if (p) {
+      const privileges = new Map((j.privileges || []).map((x) => [String(x.id), x]));
+      known = new Map((p.tracks || []).map((x) => [String(x.id), model.track(x, privileges.get(String(x.id)))]));
+      if (Array.isArray(p.trackIds) && p.trackIds.length) {
+        entries = p.trackIds.map((x) => ({ id: String(x.id), added: model.timestamp(x.at) }));
+      } else if (known.size) {
+        entries = [...known.keys()].map((trackId) => ({ id: trackId, added: "" }));
+      } else if (!Number(p.trackCount)) {
+        entries = [];
+      }
+    }
+  }
+  // 找不到红心歌单或详情缺少曲目编号时，回退到喜欢编号列表接口。
+  if (!entries) {
+    entries = (await likedIds()).map((trackId) => ({ id: trackId, added: "" }));
+    known = new Map();
+  }
+  const snapshot = { key, fetchedAt: Date.now(), entries, known };
+  if (sessionKey(currentId()) === key) likedCache = snapshot;
+  return snapshot;
+}
+
 export async function liked({ offset = 0 }) {
-  const ids = await likedIds();
   const start = offsetOf(offset);
-  return { tracks: await details(ids.slice(start, start + PAGE)), more: start + PAGE < ids.length };
+  const snapshot = await likedSnapshot(start === 0);
+  const slice = snapshot.entries.slice(start, start + PAGE);
+  const missing = [...new Set(slice.map((x) => x.id).filter((x) => !snapshot.known.has(x)))];
+  for (const track of await details(missing)) snapshot.known.set(track.id, track);
+  return {
+    tracks: slice.map(({ id: trackId, added }) => attachAdded(snapshot.known.get(trackId), added)),
+    more: start + PAGE < snapshot.entries.length,
+  };
 }
 
 export async function isLiked({ ids = [] }) {
@@ -267,6 +327,7 @@ export async function isLiked({ ids = [] }) {
 export async function like({ id: value, on }) {
   requireAccount();
   await api("/api/radio/like", { alg: "itembased", trackId: id(value), like: Boolean(on), time: "3" });
+  likedCache = null;
   host.storage.remove("likedIds");
   host.storage.remove("likedAt");
 }

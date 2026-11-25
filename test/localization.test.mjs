@@ -400,3 +400,168 @@ test("云盘可从发现页进入，新版宿主通过筛选标签翻页", async
   assert.ok(page.tabs.some(t => t.page === "cloud" && t.selected));
   assert.ok(page.tabs.some(t => t.page === ""));
 });
+
+test("喜欢的歌曲按红心歌单顺序返回并附带收藏时间，分页复用快照且补齐缺失曲目", async () => {
+  const r = await runtime("zh-CN");
+  r.store.set("cookies", { MUSIC_U: "fixture" });
+  r.store.set("account", { id: "42", name: "测试用户" });
+  const total = 52;
+  const baseAt = 1730000000000;
+  const trackIds = Array.from({ length: total }, (_, i) => ({
+    id: 2000 - i,
+    at: i === total - 1 ? 0 : baseAt - i * 1000,
+  }));
+  const firstBatch = trackIds.slice(0, 50).map(({ id }) => ({
+    id, name: `Song ${id}`, dt: 180000, ar: [{ id: 1, name: "Artist" }], al: { id: 2, name: "Album" },
+  }));
+  r.env.reply = (p, url) => {
+    if (url.endsWith("/eapi/user/playlist")) {
+      return {
+        code: 200, more: false, playlist: [
+          { id: 100, name: "别人的红心", specialType: 5, creator: { userId: 99 } },
+          { id: 101, name: "普通歌单", specialType: 0, creator: { userId: 42 } },
+          { id: 555, name: "我喜欢的音乐", specialType: 5, creator: { userId: 42 } },
+        ],
+      };
+    }
+    if (url.endsWith("/eapi/v6/playlist/detail")) {
+      assert.equal(p.id, "555");
+      return {
+        code: 200,
+        playlist: { id: 555, name: "我喜欢的音乐", specialType: 5, creator: { userId: 42 }, trackCount: total, tracks: firstBatch, trackIds },
+        privileges: firstBatch.map((x) => ({ id: x.id, st: 0 })),
+      };
+    }
+    if (url.endsWith("/eapi/v3/song/detail")) {
+      const ids = JSON.parse(p.c).map((x) => Number(x.id));
+      return {
+        code: 200,
+        songs: ids.map((id) => ({ id, name: `Song ${id}`, dt: 200000, ar: [{ id: 1, name: "Artist" }], al: { id: 2, name: "Album" } })),
+        privileges: ids.map((id) => ({ id, st: 0 })),
+      };
+    }
+    throw new Error(`unexpected url: ${url}`);
+  };
+  const page1 = await r.plugin.liked({ offset: 0 });
+  assert.equal(page1.tracks.length, 50);
+  assert.equal(page1.more, true);
+  assert.equal(page1.tracks[0].id, "2000");
+  assert.equal(page1.tracks[0].added, new Date(baseAt).toISOString());
+  assert.equal(page1.tracks[1].id, "1999");
+  assert.equal(page1.tracks[1].added, new Date(baseAt - 1000).toISOString());
+  assert.equal(r.requests.filter((q) => q.url.endsWith("/eapi/v3/song/detail")).length, 0);
+
+  const page2 = await r.plugin.liked({ offset: 50 });
+  assert.equal(page2.tracks.length, 2);
+  assert.equal(page2.more, false);
+  assert.equal(page2.tracks[0].id, "1950");
+  assert.equal(page2.tracks[0].added, new Date(baseAt - 50 * 1000).toISOString());
+  assert.equal(page2.tracks[1].id, "1949");
+  assert.equal("added" in page2.tracks[1], false);
+  assert.equal(r.requests.filter((q) => q.url.endsWith("/eapi/user/playlist")).length, 1);
+  assert.equal(r.requests.filter((q) => q.url.endsWith("/eapi/v6/playlist/detail")).length, 1);
+  assert.equal(r.requests.filter((q) => q.url.endsWith("/eapi/v3/song/detail")).length, 1);
+});
+
+test("红心操作、登出和切换账号均会失效喜欢歌曲缓存", async () => {
+  const r = await runtime("zh-CN");
+  r.store.set("cookies", { MUSIC_U: "u1" });
+  r.store.set("account", { id: "42", name: "用户一" });
+  let version = 1;
+  r.env.reply = (p, url) => {
+    if (url.endsWith("/eapi/user/playlist")) {
+      const pid = p.uid === "42" ? 555 : 666;
+      return { code: 200, more: false, playlist: [{ id: pid, name: "我喜欢的音乐", specialType: 5, creator: { userId: Number(p.uid) } }] };
+    }
+    if (url.endsWith("/eapi/v6/playlist/detail")) {
+      const ids = p.id === "555" ? (version === 1 ? [10] : [20, 10]) : [30];
+      return {
+        code: 200,
+        playlist: {
+          id: Number(p.id), specialType: 5, trackCount: ids.length,
+          tracks: ids.map((id) => ({ id, name: `Song ${id}`, dt: 1000 })),
+          trackIds: ids.map((id, i) => ({ id, at: 1730000000000 - i * 1000 })),
+        },
+        privileges: ids.map((id) => ({ id, st: 0 })),
+      };
+    }
+    if (url.endsWith("/eapi/radio/like")) return { code: 200 };
+    throw new Error(`unexpected url: ${url}`);
+  };
+  assert.deepEqual((await r.plugin.liked({ offset: 0 })).tracks.map((t) => t.id), ["10"]);
+  version = 2;
+  await r.plugin.like({ id: "20", on: true });
+  assert.deepEqual((await r.plugin.liked({ offset: 0 })).tracks.map((t) => t.id), ["20", "10"]);
+  assert.equal(r.requests.filter((q) => q.url.endsWith("/eapi/user/playlist")).length, 1);
+
+  r.plugin.signOut();
+  r.store.set("cookies", { MUSIC_U: "u2" });
+  r.store.set("account", { id: "43", name: "用户二" });
+  assert.deepEqual((await r.plugin.liked({ offset: 0 })).tracks.map((t) => t.id), ["30"]);
+  assert.equal(r.requests.filter((q) => q.url.endsWith("/eapi/user/playlist")).length, 2);
+});
+
+test("缺少红心歌单时回退到喜欢编号列表，登录失效错误直接上报", async () => {
+  const r = await runtime("zh-CN");
+  r.store.set("cookies", { MUSIC_U: "fixture" });
+  r.store.set("account", { id: "42", name: "新用户" });
+  r.env.reply = (p, url) => {
+    if (url.endsWith("/eapi/user/playlist")) return { code: 200, more: false, playlist: [] };
+    if (url.endsWith("/eapi/song/like/get")) return { code: 200, ids: [7, 8] };
+    if (url.endsWith("/eapi/v3/song/detail")) {
+      const ids = JSON.parse(p.c).map((x) => Number(x.id));
+      return { code: 200, songs: ids.map((id) => ({ id, name: `Song ${id}`, dt: 1000 })), privileges: ids.map((id) => ({ id, st: 0 })) };
+    }
+    throw new Error(`unexpected url: ${url}`);
+  };
+  const fallback = await r.plugin.liked({ offset: 0 });
+  assert.deepEqual(fallback.tracks.map((t) => t.id), ["7", "8"]);
+  assert.equal("added" in fallback.tracks[0], false);
+
+  const r2 = await runtime("zh-CN");
+  r2.store.set("cookies", { MUSIC_U: "expired" });
+  r2.store.set("account", { id: "42", name: "用户" });
+  r2.env.reply = (p, url) => {
+    if (url.endsWith("/eapi/user/playlist")) {
+      return { code: 200, more: false, playlist: [{ id: 555, specialType: 5, creator: { userId: 42 } }] };
+    }
+    if (url.endsWith("/eapi/v6/playlist/detail")) return { code: 301 };
+    throw new Error(`unexpected url: ${url}`);
+  };
+  await assert.rejects(r2.plugin.liked({ offset: 0 }), (e) => e.code === "signIn");
+  assert.equal(r2.requests.filter((q) => q.url.endsWith("/eapi/song/like/get")).length, 0);
+});
+
+test("歌单详情保留添加时间，且读取歌单列表后喜欢的歌曲复用了红心歌单编号", async () => {
+  const r = await runtime("zh-CN");
+  r.store.set("cookies", { MUSIC_U: "fixture" });
+  r.store.set("account", { id: "42", name: "用户" });
+  r.env.reply = (p, url) => {
+    if (url.endsWith("/eapi/user/playlist")) {
+      return { code: 200, more: false, playlist: [{ id: 555, name: "我喜欢的音乐", specialType: 5, creator: { userId: 42 } }] };
+    }
+    if (url.endsWith("/eapi/v6/playlist/detail")) {
+      return {
+        code: 200,
+        playlist: {
+          id: 555, name: "我喜欢的音乐", specialType: 5, creator: { userId: 42 }, trackCount: 2,
+          tracks: [{ id: 101, name: "First", dt: 1000 }],
+          trackIds: [{ id: 101, at: 1730000000000 }, { id: 102, at: 0 }],
+        },
+        privileges: [{ id: 101, st: 0 }],
+      };
+    }
+    if (url.endsWith("/eapi/v3/song/detail")) {
+      return { code: 200, songs: [{ id: 102, name: "Second", dt: 1000 }], privileges: [{ id: 102, st: 0 }] };
+    }
+    throw new Error(`unexpected url: ${url}`);
+  };
+  const pls = await r.plugin.playlists();
+  assert.equal(pls[0].fixed, true);
+  const pl = await r.plugin.playlist({ id: "555" });
+  assert.equal(pl.tracks[0].added, new Date(1730000000000).toISOString());
+  assert.equal("added" in pl.tracks[1], false);
+  const lk = await r.plugin.liked({ offset: 0 });
+  assert.deepEqual(lk.tracks.map((t) => t.id), ["101", "102"]);
+  assert.equal(r.requests.filter((q) => q.url.endsWith("/eapi/user/playlist")).length, 1);
+});
