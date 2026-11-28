@@ -516,9 +516,33 @@ export async function stream({ id: value, quality = "high" }) {
   fail("unavailable", hasSession() ? "此歌曲需要会员、单独购买，或当前地区无版权；不会以试听片段代替完整歌曲" : "此歌曲需要登录或相应会员权限，请先扫码登录网易云音乐");
 }
 
+const lyricText = (value) => typeof value === "string" ? value : value?.lyric || "";
+// 网易云会用「暂无歌词」「纯音乐」等占位行代替空歌词，不能只判断字符串是否为空。
+const LYRIC_PLACEHOLDER = /^(暂无歌词|无歌词|纯音乐|纯音乐，?请欣赏)$/;
+function missingOnlineLyrics(lrc, response) {
+  if (response?.nolyric || response?.uncollected) return true;
+  const text = lrc.replace(/\[[^\]]*\]/g, "").trim();
+  return !text || LYRIC_PLACEHOLDER.test(text);
+}
+
 export async function lyrics({ id: value }) {
-  const j = await api("/api/song/lyric", { id: id(value), tv: -1, lv: -1, rv: -1, kv: -1, _nmclfl: 1 });
-  return { lrc: j.lrc?.lyric || "", translation: j.tlyric?.lyric || "" };
+  const songId = id(value);
+  const j = await api("/api/song/lyric", { id: songId, tv: -1, lv: -1, rv: -1, kv: -1, _nmclfl: 1 });
+  let lrc = j.lrc?.lyric || "";
+  let translation = j.tlyric?.lyric || "";
+  // 云盘歌曲没有在线歌词时，取上传文件内嵌的 LYRICS 标签；普通曲库文件不带歌词。
+  const account = hasSession() ? host.storage.get("account") : null;
+  if (missingOnlineLyrics(lrc, j) && account?.id) {
+    try {
+      const cloud = await api("/api/cloud/lyric/get", { userId: account.id, songId, lv: -1, kv: -1 });
+      const embedded = lyricText(cloud.lrc);
+      if (embedded.trim()) {
+        lrc = embedded;
+        translation = lyricText(cloud.tlyric);
+      }
+    } catch (_) { /* 内嵌歌词是可选的，取不到时保持无歌词 */ }
+  }
+  return { lrc, translation };
 }
 
 export function trackMenu() {

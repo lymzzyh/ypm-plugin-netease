@@ -329,6 +329,67 @@ test("登录失效和网络错误立即报告，不伪装成音质降级", async
   assert.equal(r.requests.length, 1);
 });
 
+test("在线歌词为空时回退到云盘内嵌歌词", async () => {
+  const r = await runtime("zh-CN");
+  r.store.set("cookies", { MUSIC_U: "fixture-session" });
+  r.store.set("account", { id: "42", name: "测试用户" });
+  r.env.reply = (payload) => {
+    if (payload.songId) return { code: 200, lrc: "[00:01.00]内嵌歌词", tlyric: "[00:01.00]Embedded" };
+    return { code: 200, lrc: { lyric: "" }, tlyric: { lyric: "" } };
+  };
+  assert.deepEqual({ ...(await r.plugin.lyrics({ id: "77" })) }, {
+    lrc: "[00:01.00]内嵌歌词", translation: "[00:01.00]Embedded",
+  });
+  const fallback = r.requests.find(q => q.payload.songId);
+  assert.equal(fallback.payload.userId, "42");
+  assert.equal(fallback.payload.songId, "77");
+  assert.equal(fallback.payload.lv, -1);
+  assert.equal(fallback.payload.kv, -1);
+});
+
+test("在线歌词只有占位提示时仍回退到云盘内嵌歌词", async () => {
+  const r = await runtime();
+  r.store.set("cookies", { MUSIC_U: "fixture-session" });
+  r.store.set("account", { id: "42", name: "测试用户" });
+  r.env.reply = (payload) => payload.songId
+    ? { code: 200, lrc: "[00:00.000]内嵌歌词" }
+    : { code: 200, uncollected: true, lrc: { lyric: "[00:00.00]暂无歌词" }, tlyric: { lyric: "" } };
+  const out = await r.plugin.lyrics({ id: "7" });
+  assert.equal(out.lrc, "[00:00.000]内嵌歌词");
+  assert.equal(r.requests.filter(q => q.payload.songId).length, 1);
+});
+
+test("在线歌词可用时不再请求云盘歌词", async () => {
+  const r = await runtime();
+  r.store.set("cookies", { MUSIC_U: "fixture-session" });
+  r.store.set("account", { id: "42", name: "测试用户" });
+  r.env.reply = (payload) => payload.songId
+    ? { code: 200, lrc: "[00:02.00]云盘歌词" }
+    : { code: 200, lrc: { lyric: "[00:01.00]在线歌词" }, tlyric: { lyric: "[00:01.00]Online" } };
+  assert.deepEqual({ ...(await r.plugin.lyrics({ id: "1" })) }, {
+    lrc: "[00:01.00]在线歌词", translation: "[00:01.00]Online",
+  });
+  assert.equal(r.requests.filter(q => q.payload.songId).length, 0);
+});
+
+test("未登录时不请求云盘歌词", async () => {
+  const r = await runtime();
+  r.env.reply = () => ({ code: 200, lrc: { lyric: "" } });
+  assert.deepEqual({ ...(await r.plugin.lyrics({ id: "1" })) }, { lrc: "", translation: "" });
+  assert.equal(r.requests.length, 1);
+});
+
+test("云盘歌词不可用时保持空歌词而不是报错", async () => {
+  const r = await runtime();
+  r.store.set("cookies", { MUSIC_U: "fixture-session" });
+  r.store.set("account", { id: "42", name: "测试用户" });
+  r.env.reply = (payload) => payload.songId
+    ? { code: 404 }
+    : { code: 200, lrc: { lyric: "" } };
+  assert.deepEqual({ ...(await r.plugin.lyrics({ id: "1" })) }, { lrc: "", translation: "" });
+  assert.ok(r.requests.some(q => q.payload.songId === "1"));
+});
+
 test("云盘要求登录；未登录不请求个人数据", async () => {
   const r = await runtime("zh-CN");
   await assert.rejects(r.plugin.browse({ page: "cloud" }), e => e.code === "signIn");
