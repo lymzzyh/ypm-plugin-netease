@@ -33,7 +33,7 @@ Choose a quality in Settings → Plugins → NetEase Cloud Music → Settings. S
 - Album, artist, and playlist pages, with playlist tracks loaded in their original order
 - Liked tracks, saved albums, personal playlists, and recent listening history; like/unlike tracks and save/unsave albums
 - Standard, High, Lossless, and Hi-Res playback, subject to account permissions and availability
-- Synced LRC lyrics and translations when available, plus a track menu shortcut to the NetEase website
+- Synced LRC lyrics and translations when available, plus embedded lyrics from cloud music files when online lyrics are missing, and a track menu shortcut to the NetEase website
 - Automatic QR refresh, retries for temporary connection failures, and protection against outdated sign-in responses
 - Interface translations matching YesPlayMusic: English, Simplified Chinese, Traditional Chinese, Japanese, Korean, French, German, Spanish, and Russian
 
